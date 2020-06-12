@@ -5,8 +5,9 @@
 //   unsafe.
 
 use crossbeam::queue::SegQueue;
-use futures::sync::oneshot::{self, Canceled, Receiver, Sender};
-use futures::{Future, Poll};
+use futures::channel::oneshot::{self, Canceled, Receiver, Sender};
+use std::{pin::Pin, task::Context, task::Poll};
+use futures::{Future};
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicUsize;
@@ -66,29 +67,27 @@ impl<T> FutureGuard<T> {
             rx: rx,
         }
     }
-
-    /// Blocks the current thread until this future resolves.
-    #[inline]
-    pub fn wait(self) -> Result<Guard<T>, Canceled> {
-        <Self as Future>::wait(self)
-    }
+    
 }
 
 impl<T> Future for FutureGuard<T> {
-    type Item = Guard<T>;
-    type Error = Canceled;
+    type Output = Guard<T>;
 
     #[inline]
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         if self.qutex.is_some() {
             unsafe { self.qutex.as_ref().unwrap().process_queue() }
-
-            match self.rx.poll() {
-                Ok(status) => Ok(status.map(|_| Guard {
-                    qutex: self.qutex.take().unwrap(),
-                })),
-                Err(e) => Err(e.into()),
+            match Pin::new(&mut self.rx).poll(cx) {
+                Poll::Ready(status) => { 
+                    let guard = status.map(|_| Guard {
+                        qutex: self.qutex.take().unwrap(),
+                    }).unwrap();
+                    return Poll::Ready(guard);
             }
+                Poll::Pending => {
+                    return Poll::Pending;
+            }
+        }
         } else {
             panic!("FutureGuard::poll: Task already completed.");
         }

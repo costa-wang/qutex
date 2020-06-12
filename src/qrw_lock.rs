@@ -18,8 +18,9 @@
 //
 
 use crossbeam::queue::SegQueue;
-use futures::sync::oneshot::{self, Canceled, Receiver, Sender};
-use futures::{Async, Future, Poll};
+use futures::channel::oneshot::{self, Canceled, Receiver, Sender};
+use std::{pin::Pin, task::Context, task::Poll};
+use futures::{Future};
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering::{Acquire, SeqCst};
@@ -205,38 +206,33 @@ impl<T> FutureUpgrade<T> {
             rx: rx,
         }
     }
-
-    /// Blocks the current thread until this future resolves.
-    #[inline]
-    pub fn wait(self) -> Result<WriteGuard<T>, Canceled> {
-        <Self as Future>::wait(self)
-    }
 }
 
 impl<T> Future for FutureUpgrade<T> {
-    type Item = WriteGuard<T>;
-    type Error = Canceled;
+    type Output = WriteGuard<T>;
 
     #[inline]
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output>  {
         if self.lock.is_some() {
             // FUTURE NOTE: Lexical borrowing should allow this to be
             // restructured without the extra `.unwrap()` below.
             if self.rx.is_none() {
                 print_debug("qutex::FutureUpgrade::poll: Uncontended. Upgrading.");
-                Ok(Async::Ready(WriteGuard {
+                Poll::Ready(WriteGuard {
                     lock: self.lock.take().unwrap(),
-                }))
+                })
             } else {
                 unsafe { self.lock.as_ref().unwrap().process_queues() }
-                self.rx.as_mut().unwrap().poll().map(|res| {
-                    res.map(|_| {
-                        print_debug("qutex::FutureUpgrade::poll: Ready. Upgrading.");
-                        WriteGuard {
-                            lock: self.lock.take().unwrap(),
-                        }
-                    })
-                })
+                match Pin::new(&mut self.rx.unwrap()).poll(cx) {
+                    Poll::Ready(res) => return Poll::Ready(
+                        res.map(|_| {
+                            print_debug("qutex::FutureWriteGuard::poll: WriteGuard acquired.");
+                            WriteGuard {
+                                lock: self.lock.take().unwrap(),
+                            }
+                        })),
+                    Poll::Pending => return Poll::Pending
+                }
             }
         } else {
             panic!("FutureUpgrade::poll: Task already completed.");
@@ -284,29 +280,30 @@ impl<T> FutureReadGuard<T> {
         }
     }
 
-    /// Blocks the current thread until this future resolves.
-    #[inline]
-    pub fn wait(self) -> Result<ReadGuard<T>, Canceled> {
-        <Self as Future>::wait(self)
-    }
+    // Blocks the current thread until this future resolves.
+    // #[inline]
+    // pub fn wait(self) -> Result<ReadGuard<T>, Canceled> {
+    //     <Self as Future>::wait(self)
+    // }
 }
 
 impl<T> Future for FutureReadGuard<T> {
-    type Item = ReadGuard<T>;
-    type Error = Canceled;
+    type Output = ReadGuard<T>;
 
     #[inline]
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         if self.lock.is_some() {
             unsafe { self.lock.as_ref().unwrap().process_queues() }
-            self.rx.poll().map(|res| {
-                res.map(|_| {
-                    print_debug("qutex::FutureReadGuard::poll: ReadGuard acquired.");
-                    ReadGuard {
-                        lock: self.lock.take().unwrap(),
-                    }
-                })
-            })
+            match Pin::new(&mut self.rx).poll(cx) {
+                Poll::Ready(res) => return Poll::Ready(
+                    res.map(|_| {
+                        print_debug("qutex::FutureReadGuard::poll: ReadGuard acquired.");
+                        ReadGuard {
+                            lock: self.lock.take().unwrap(),
+                        }
+                    })),
+                Poll::Pending => return Poll::Pending
+            }
         } else {
             panic!("FutureReadGuard::poll: Task already completed.");
         }
@@ -347,30 +344,30 @@ impl<T> FutureWriteGuard<T> {
             rx: rx,
         }
     }
-
-    /// Blocks the current thread until this future resolves.
-    #[inline]
-    pub fn wait(self) -> Result<WriteGuard<T>, Canceled> {
-        <Self as Future>::wait(self)
-    }
 }
 
 impl<T> Future for FutureWriteGuard<T> {
-    type Item = WriteGuard<T>;
-    type Error = Canceled;
+    type Output = WriteGuard<T>;
 
     #[inline]
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         if self.lock.is_some() {
             unsafe { self.lock.as_ref().unwrap().process_queues() }
-            self.rx.poll().map(|res| {
-                res.map(|_| {
-                    print_debug("qutex::FutureWriteGuard::poll: WriteGuard acquired.");
-                    WriteGuard {
-                        lock: self.lock.take().unwrap(),
-                    }
-                })
-            })
+
+            match Pin::new(&mut self.rx).poll(cx) {
+                Poll::Ready(res) => {
+                    let guard = res.map(|_| {
+                        print_debug("qutex::FutureWriteGuard::poll: WriteGuard acquired.");
+                        WriteGuard {
+                            lock: self.lock.take().unwrap(),
+                        }
+                    }).unwrap();
+                    return Poll::Ready(guard);
+                },
+                Poll::Pending => {
+                    return Poll::Pending
+                }
+            }
         } else {
             panic!("FutureWriteGuard::poll: Task already completed.");
         }
