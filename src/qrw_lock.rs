@@ -18,7 +18,7 @@
 //
 
 use crossbeam::queue::SegQueue;
-use futures::channel::oneshot::{self, Canceled, Receiver, Sender};
+use futures::channel::oneshot::{self, Receiver, Sender};
 use std::{pin::Pin, task::Context, task::Poll};
 use futures::{Future};
 use std::cell::UnsafeCell;
